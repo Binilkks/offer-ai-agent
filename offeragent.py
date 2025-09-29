@@ -38,10 +38,15 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "./agent.json"
 # ------------------------
 def speak_text(text: str):
     """Convert text to speech and play via speakers."""
+    print(f"🗣️ Agent says: {text}")
     client = texttospeech.TextToSpeechClient()
     synthesis_input = texttospeech.SynthesisInput(text=text)
-    voice = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Wavenet-F")
-    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.LINEAR16)
+    voice = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Studio-O")
+    audio_config = texttospeech.AudioConfig(
+    audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+    speaking_rate=1.05,  # Slightly faster
+    pitch=2.0            # Slightly higher pitch for warmth
+)
     response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
     audio = np.frombuffer(response.audio_content, dtype=np.int16)
     sd.play(audio, samplerate=24000)
@@ -71,12 +76,50 @@ def record_and_transcribe(duration=4):
         print("❗ No speech recognized.")
     return ""
 
+def analyze_intro_offer_query(query: str):
+    messages = [
+        HumanMessage(content=f"""
+You are an assistant introducing a credit card promotional offer to a customer.
+
+Examples:
+Customer: Yes, tell me more.
+Agent: DETAILS
+
+Customer: Sure, explain the offer.
+Agent: DETAILS
+
+Customer: Yes.
+Agent: DETAILS
+
+Customer: Okay, go ahead.
+Agent: DETAILS
+
+Customer: No, I'm not interested.
+Agent: DECLINE
+
+Customer: No thanks.
+Agent: DECLINE
+
+Customer: Not now.
+Agent: DECLINE
+
+Instructions:
+1. If the customer wants to hear more, says 'yes', 'tell me more', 'explain', 'sure', 'okay', or anything similar, respond ONLY with: DETAILS
+2. If the customer declines, says 'no', 'not interested', 'no thanks', or anything similar, respond ONLY with: DECLINE
+3. If unclear, ask politely: "Would you like to hear more about the promotional offer?"
+
+Customer input: {query}
+""")
+    ]
+    response = llm(messages)
+    return response.content.strip()
+
 def analyze_customer_query(query: str):
     messages = [
         HumanMessage(content=f"""
 Here are the offer terms: {OFFER_TERMS}
 
-You are an assistant handling credit card offer disclosures.
+You are an assistant handling customer responses after the offer terms have been read.
 
 Examples:
 Customer: No, I'm good.
@@ -109,13 +152,19 @@ Agent: DECLINE
 Customer: Please stop, I don’t want it.
 Agent: DECLINE
 
+Customer: Tell me more.
+Agent: DETAILS
+
+Customer: Yes, explain the offer.
+Agent: DETAILS
+
 Instructions:
 1. If the customer asks a clarification that is **directly related to the offer terms**, answer briefly using the offer terms above, then ask: "Do you have any questions about the promotional offer?"
-2. If the customer says they have no questions (e.g., 'no', 'I'm good', 'no questions', 'everything is clear') → respond ONLY with: "Do I have your consent to enroll your card account in this Promotional APR Offer?"
-3. If the customer gives consent (e.g., 'yes', 'I agree', 'proceed', 'sounds good') → respond ONLY with: CONSENT
-4. If the customer asks anything **not related to the offer terms** → respond ONLY with: HANDOFF
-5. If the customer **clearly declines the offer** (e.g., 'no I'm not interested', 'I don’t want it', 'please stop', 'not interested') → respond ONLY with: DECLINE
-6. If unclear, ask politely to repeat.
+3. If the customer says they have no questions (e.g., 'no', 'I'm good', 'no questions', 'everything is clear') → respond ONLY with: "Do I have your consent to enroll your card account in this Promotional APR Offer?"
+4. If the customer gives consent (e.g., 'yes', 'I agree', 'proceed', 'sounds good') → respond ONLY with: CONSENT
+5. If the customer asks anything **not related to the offer terms** → respond ONLY with: HANDOFF
+6. If the customer **clearly declines the offer** (e.g., 'no I'm not interested', 'I don’t want it', 'please stop', 'not interested') → respond ONLY with: DECLINE
+7. If the input is unclear or incomplete, respond ONLY with: "I'm sorry, I didn't catch that. Could you please repeat or clarify your question?"
 
 Customer input: {query}
 """)
@@ -131,6 +180,78 @@ class OfferAgentState(TypedDict, total=False):
     customer_input: str
     step: str
 
+def generate_intro_statement(customer_name, tenure, balance, offer_summary):
+    prompt = f"""
+You are a friendly customer service agent. Write a brief, natural-sounding introduction for a promotional call.
+Personalize it using the following details:
+- Customer name: {customer_name}
+- Tenure: {tenure}
+- Pay Over Time balance: {balance}
+- Offer summary: {offer_summary}
+
+Keep the introduction brief and friendly. Do not say "thank you for taking my call." 
+Do NOT preface your response with any explanation or meta-text. 
+Respond ONLY with the introduction you would say to the customer.
+Greet the customer, mention their tenure and balance, introduce the offer, and end by asking if they would like to hear more details.
+"""
+    messages = [HumanMessage(content=prompt)]
+    response = llm(messages)
+    return response.content.strip()
+
+def intro_offer(state: OfferAgentState) -> OfferAgentState:
+    customer_name = state.get("customer_name", "John")
+    tenure = state.get("tenure", "5 years")
+    balance = state.get("balance", "$1,500")
+    offer_summary = "We have a limited-time offer that could lower your interest rate on new purchases."
+
+    intro = (
+        f"Hi {customer_name}, thanks for being with us for {tenure}. "
+        f"I see your current Pay Over Time balance is {balance}. "
+        "We have a limited-time offer that could lower your interest rate on new purchases. "
+        "Would you like me to explain the details?"
+    )
+    
+    intro = generate_intro_statement(customer_name, tenure, balance, offer_summary)
+    speak_text(intro)
+    return {**state, "step": "intro_offer"}
+
+def generate_offer_summary(balance, new_purchase, current_apr, promo_apr, interest_current, interest_promo, savings):
+    prompt = f"""
+You are a friendly customer service agent. Write a brief, natural-sounding summary for a credit card promotional APR offer.
+Personalize it using the following details:
+- Current Pay Over Time balance: ${balance}
+- Example new purchase amount: ${new_purchase}
+- Current APR: {current_apr}%
+- Promotional APR: {promo_apr}%
+- Interest at current APR: ${interest_current:.2f}
+- Interest at promo APR: ${interest_promo:.2f}
+- Savings: ${savings:.2f}
+
+Do NOT greet the customer or say hello. The customer has already been greeted.
+Keep it concise, friendly, and easy to understand. End by saying you'll now read the official terms.
+"""
+    messages = [HumanMessage(content=prompt)]
+    response = llm(messages)
+    return response.content.strip()
+
+def offer_details(state: OfferAgentState) -> OfferAgentState:
+    balance = 1500  # you can pull from customer data API
+    new_purchase = 1500
+    current_apr = 20.99
+    promo_apr = 8.99
+
+    interest_current = new_purchase * (current_apr / 100)
+    interest_promo = new_purchase * (promo_apr / 100)
+    savings = interest_current - interest_promo
+
+    summary = generate_offer_summary(
+        balance, new_purchase, current_apr, promo_apr, interest_current, interest_promo, savings
+    )
+
+    speak_text(summary)
+    speak_text(OFFER_TERMS)
+    return {**state, "step": "listen_customer"}
+
 def read_offer(state: OfferAgentState) -> OfferAgentState:
     print("DEBUG: Reading offer terms...", OFFER_TERMS)
     speak_text(f"Hello. We have an offer for you. {OFFER_TERMS}")
@@ -143,29 +264,32 @@ def listen_customer(state: OfferAgentState) -> OfferAgentState:
 
 def analyze_response(state: OfferAgentState) -> OfferAgentState:
     transcript = state.get("customer_input", "")
-    result = analyze_customer_query(transcript)
-    
-    # Check for consent
-    if result.upper().endswith("CONSENT"):
-        speak_text("Thank you for your consent. I am going to submit the application for processing.")
-        state["step"] = "consent"
-
-    elif result.upper().endswith("DECLINE"):
-        state["step"] = "decline"
-    # Check if agent should ask for consent
-
-        # Handoff to live agent
-    elif result.upper().endswith("HANDOFF"):
-        speak_text("I understand your question is about your account services. Since this isn’t related to the promotional APR offer, I’ll transfer you to a live agent who can further assist you.")
-        state["step"] = "handoff"
-
-    elif "Do I have your consent" in result:
-        speak_text(result)
-        state["step"] = "ask_consent"
-    # Otherwise, it's a clarification or repeat
+    step = state.get("step", "")
+    if step == "intro_offer":
+        # Use your intro offer analyzer
+        result = analyze_intro_offer_query(transcript)
+        if result.upper().endswith("DETAILS"):
+            state["step"] = "details"
+        elif result.upper().endswith("DECLINE"):
+            state["step"] = "decline"
     else:
-        speak_text(result)
-        state["step"] = "clarification"
+        result = analyze_customer_query(transcript)
+        if result.upper().endswith("CONSENT"):
+            speak_text("Thank you for your consent. I am going to submit the application for processing.")
+            state["step"] = "consent"
+        elif result.upper().endswith("DECLINE"):
+            state["step"] = "decline"
+
+        elif result.upper().endswith("HANDOFF"):
+            speak_text("I understand your question is about your account services. Since this isn’t related to the promotional APR offer, I’ll transfer you to a live agent who can further assist you.")
+            state["step"] = "handoff"
+        elif "Do I have your consent" in result:
+            speak_text(result)
+            state["step"] = "ask_consent"
+        # Otherwise, it's a clarification or repeat
+        else:
+            speak_text(result)
+            state["step"] = "clarification"
 
     return state
 
@@ -188,33 +312,36 @@ def handoff(state: OfferAgentState) -> OfferAgentState:
 # GRAPH
 # ------------------------
 graph = StateGraph(OfferAgentState)
-graph.add_node("read_offer", read_offer)
+graph.add_node("intro_offer", intro_offer)
+graph.add_node("details", offer_details)
 graph.add_node("listen_customer", listen_customer)
 graph.add_node("analyze_response", analyze_response)
 graph.add_node("process_application", process_application)
 graph.add_node("decline", handle_decline)
 graph.add_node("handoff", handoff)
 
-
-graph.add_edge("read_offer", "listen_customer")
+graph.add_edge("intro_offer", "listen_customer")
 graph.add_edge("listen_customer", "analyze_response")
+graph.add_edge("details", "listen_customer")
 graph.add_conditional_edges(
     "analyze_response",
     lambda state: (
         "process_application" if state.get("step") == "consent"
         else "handoff" if state.get("step") == "handoff"
         else "decline" if state.get("step") == "decline"
+        else "details" if state.get("step") == "details"
         else "listen_customer"
     ),
     {
         "process_application": "process_application",
         "handoff": "handoff",
         "decline": "decline",
+        "details": "details",
         "listen_customer": "listen_customer"
     }
 )
 
-graph.set_entry_point("read_offer")
+graph.set_entry_point("intro_offer")
 
 workflow = graph.compile()
 
